@@ -30,3 +30,9 @@ jobs:
           cd build
           zip ../website.zip index.html
           echo "Application packaged"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-package
+          path: website.zip
