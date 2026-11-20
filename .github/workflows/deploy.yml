@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build-test-package:
     runs-on: ubuntu-latest
@@ -36,3 +40,72 @@ jobs:
         with:
           name: website-package
           path: website.zip
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload application to S3
+        run: |
+          aws s3 cp website.zip s3://${{ vars.S3_BUCKET }}/website.zip
+          echo "Application uploaded to S3"
+
+      - name: Deploy application to EC2
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+        run: |
+          PARAMETERS=$(cat <<EOF
+          {
+            "commands": [
+              "set -e",
+              "aws s3 cp s3://${S3_BUCKET}/website.zip /tmp/website.zip",
+              "if ! command -v unzip >/dev/null 2>&1; then apt-get update && apt-get install -y unzip; fi",
+              "unzip -o /tmp/website.zip -d /var/www/html",
+              "chown -R www-data:www-data /var/www/html",
+              "systemctl restart apache2",
+              "systemctl is-active --quiet apache2"
+            ]
+          }
+          EOF
+          )
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "i-0792e9c9b9c11877b" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy website from GitHub Actions" \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          STATUS=""
+
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "i-0792e9c9b9c11877b" \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            case "$STATUS" in
+              Success|Failed|TimedOut|Cancelled|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated|InvalidPlatform|AccessDenied)
+                break
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "i-0792e9c9b9c11877b" \
+            --query "{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}" \
+            --output json
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Deployment failed. Final status: $STATUS"
+            exit 1
+          fi
